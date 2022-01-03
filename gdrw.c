@@ -165,6 +165,57 @@ int eraseCommand(SerialPort* port, int argc, char* argv[]) {
 	return 0;
 }
 
+int writeCommand(SerialPort* port, int argc, char* argv[]) {
+	unsigned long address;
+	FILE* fpIn;
+	char* end;
+	if (argc < 2) return errorRet(1, "required argument(s) not given\n");
+	errno = 0;
+	address = strtoul(argv[0], &end, 0);
+	if (argv[0][0] == '\0' || *end != '\0' || errno == ERANGE) return errorRet(1, "invalid address\n");
+	fpIn = fopen(argv[1], "rb");
+	if (fpIn == NULL) return errorRet(1, "failed to open input file\n");
+	for (;;) {
+		unsigned char commBuffer[8], fileBuffer[256];
+		size_t sizeRead, i;
+		sizeRead = fread(fileBuffer, 1, 256, fpIn);
+		while (sizeRead < 256) {
+			size_t sizeRead2;
+			if (ferror(fpIn)) return errorCloseRet(1, fpIn, "failed to read file at write address 0x%lx\n", address);
+			if (feof(fpIn)) break;
+			sizeRead2 = fread(fileBuffer + sizeRead, 1, 256 - sizeRead, fpIn);
+			sizeRead += sizeRead2;
+		}
+		if (sizeRead == 0) break;
+		while (sizeRead % 4 != 0) {
+			fileBuffer[sizeRead++] = 0xff;
+		}
+		if (serialSend(port, "\x31\xce", 2, 1) != 2) return errorCloseRet(1, fpIn, "command: failed to send at write address 0x%lx\n", address);
+		if (serialRecv(port, commBuffer, 1, 1) != 1) return errorCloseRet(1, fpIn, "command: failed to receive at write address 0x%lx\n", address);
+		if (commBuffer[0] != ACK) return errorCloseRet(1, fpIn, "command: what is returned is not ACK at write address 0x%lx\n", address);
+		commBuffer[0] = (unsigned char)(address >> 24);
+		commBuffer[1] = (unsigned char)(address >> 16);
+		commBuffer[2] = (unsigned char)(address >> 8);
+		commBuffer[3] = (unsigned char)(address);
+		commBuffer[4] = commBuffer[0] ^ commBuffer[1] ^ commBuffer[2] ^ commBuffer[3];
+		if (serialSend(port, commBuffer, 5, 1) != 5) return errorCloseRet(1, fpIn, "address: failed to send at write address 0x%lx\n", address);
+		if (serialRecv(port, commBuffer, 1, 1) != 1) return errorCloseRet(1, fpIn, "address: failed to receive at write address 0x%lx\n", address);
+		if (commBuffer[0] != ACK) return errorCloseRet(1, fpIn, "address: what is returned is not ACK at write address 0x%lx\n", address);
+		commBuffer[0] = (unsigned char)(sizeRead - 1);
+		if (serialSend(port, commBuffer, 1, 1) != 1) return errorCloseRet(1, fpIn, "data: failed to send at write address 0x%lx\n", address);
+		if (serialSend(port, fileBuffer, sizeRead, 1) != (int)sizeRead) return errorCloseRet(1, fpIn, "data: failed to send at write address 0x%lx\n", address);
+		for (i = 0; i < sizeRead; i++) {
+			commBuffer[0] ^= fileBuffer[i];
+		}
+		if (serialSend(port, commBuffer, 1, 1) != 1) return errorCloseRet(1, fpIn, "data: failed to send at write address 0x%lx\n", address);
+		if (serialRecv(port, commBuffer, 1, 1) != 1) return errorCloseRet(1, fpIn, "data: failed to receive at write address 0x%lx\n", address);
+		if (commBuffer[0] != ACK) return errorCloseRet(1, fpIn, "data: what is returned is not ACK at write address 0x%lx\n", address);
+		address += sizeRead;
+	}
+	fclose(fpIn);
+	return 0;
+}
+
 int main(int argc, char* argv[]) {
 	SerialPort* port;
 	int ret = 0;
@@ -175,6 +226,7 @@ int main(int argc, char* argv[]) {
 		fprintf(stderr, "  read <start_address> <length> <out_file>\n");
 		fprintf(stderr, "  erase global\n");
 		fprintf(stderr, "  erase <page number> [<page number> ...]\n");
+		fprintf(stderr, "  write <start_address> <in_file>\n");
 		return 1;
 	}
 	port = serialInit(argv[1], 57600, 0, 0, PALITY_EVEN);
@@ -188,6 +240,8 @@ int main(int argc, char* argv[]) {
 		ret = readCommand(port, argc - 3, argv + 3);
 	} else if (strcmp(argv[2], "erase") == 0) {
 		ret = eraseCommand(port, argc - 3, argv + 3);
+	} else if (strcmp(argv[2], "write") == 0) {
+		ret = writeCommand(port, argc - 3, argv + 3);
 	} else {
 		fprintf(stderr, "unknown command\n");
 		ret = 1;
