@@ -80,11 +80,12 @@ int readCommand(SerialPort* port, int argc, char* argv[]) {
 }
 
 int eraseCommand(SerialPort* port, int argc, char* argv[]) {
-	char pagesToErase[256] = {0};
-	unsigned char sendBuffer[256 + 2], recvBuffer;
+	unsigned char pagesToErase[0x10000 / 8] = {0};
+	unsigned char sendBuffer[3], recvBuffer;
 	int isGlobal = 0;
 	int i;
-	int erasePageCount;
+	int erasePageCount, highPageEraseRequested = 0;
+	int getDataSize, eraseSupported = 0, extendedEraseSupported = 0;
 	for (i = 0; i < argc; i++) {
 		if (strcmp(argv[i], "global") == 0) {
 			isGlobal = 1;
@@ -119,8 +120,8 @@ int eraseCommand(SerialPort* port, int argc, char* argv[]) {
 				unsigned long no;
 				errno = 0;
 				no = strtoul(argv[i], &end, 10);
-				if (errno == ERANGE || no > 0xff) return errorRet(1, "invalid page number\n");
-				pagesToErase[no] = 1;
+				if (errno == ERANGE || no > 0xffff) return errorRet(1, "invalid page number\n");
+				pagesToErase[no / 8] |= 1 << (no % 8);
 			} else if (status == 3) {
 				char* end;
 				unsigned long noStart, noEnd, no;
@@ -128,40 +129,107 @@ int eraseCommand(SerialPort* port, int argc, char* argv[]) {
 				noStart = strtoul(argv[i], &end, 10);
 				if (errno == ERANGE) return errorRet(1, "invalid page range\n");
 				noEnd = strtoul(end + 1, &end, 10);
-				if (errno == ERANGE || noEnd < noStart || noEnd > 0xff) return errorRet(1, "invalid page range\n");
-				for (no = noStart; no <= noEnd; no++) pagesToErase[no] = 1;
+				if (errno == ERANGE || noEnd < noStart || noEnd > 0xffff) return errorRet(1, "invalid page range\n");
+				for (no = noStart; no <= noEnd; no++) {
+					pagesToErase[no / 8] |= 1 << (no % 8);
+				}
 			} else {
 				return errorRet(1, "invalid argument: %s\n", argv[i]);
 			}
 		}
 	}
 	erasePageCount = 0;
-	for (i = 0; i < 256; i++) {
-		if (pagesToErase[i]) {
-			sendBuffer[++erasePageCount] = (unsigned char)i;
+	for (i = 0; i < 0x10000; i++) {
+		if ((pagesToErase[i / 8] >> (i % 8)) & 1) {
+			erasePageCount++;
+			if (i >= 0x100) highPageEraseRequested = 1;
 		}
 	}
 	if (!isGlobal && erasePageCount == 0) {
 		return errorRet(1, "no page to erase\n");
 	}
-	if (serialSend(port, "\x43\xbc", 2, 1) != 2) return errorRet(1, "failed to send\n");
+
+	/* Get command to check (Extended) Erase Memory command is supported */
+	if (serialSend(port, "\x00\xff", 2, 1) != 2) return errorRet(1, "failed to send\n");
 	if (serialRecv(port, &recvBuffer, 1, 1) != 1) return errorRet(1, "failed to receive\n");
 	if (recvBuffer != ACK) return errorRet(1, "what is returned is not ACK\n");
-	if (isGlobal) {
-		sendBuffer[0] = 0xff;
-		sendBuffer[1] = 0x00;
-		if (serialSend(port, sendBuffer, 2, 1) != 2) return errorRet(1, "failed to send\n");
-	} else {
-		unsigned char checksum = 0;
-		sendBuffer[0] = (unsigned char)(erasePageCount - 1);
-		for (i = 0; i <= erasePageCount; i++) {
-			checksum ^= sendBuffer[i];
+	if (serialRecv(port, &recvBuffer, 1, 1) != 1) return errorRet(1, "failed to receive\n");
+	getDataSize = recvBuffer;
+	for (i = 0; i <= getDataSize; i++) {
+		if (serialRecv(port, &recvBuffer, 1, 1) != 1) return errorRet(1, "failed to receive\n");
+		if (i > 0) { /* exclude the bootloader version */
+			if (recvBuffer == 0x43) eraseSupported = 1;
+			else if (recvBuffer == 0x44) extendedEraseSupported = 1;
 		}
-		sendBuffer[erasePageCount + 1] = checksum;
-		if (serialSend(port, sendBuffer, erasePageCount + 2, 1) != erasePageCount + 2) return errorRet(1, "failed to send\n");
 	}
 	if (serialRecv(port, &recvBuffer, 1, 1) != 1) return errorRet(1, "failed to receive\n");
 	if (recvBuffer != ACK) return errorRet(1, "what is returned is not ACK\n");
+
+	if (extendedEraseSupported) {
+		if (erasePageCount > 0xfff0) {
+			return errorRet(1, "too many pages to erase\n");
+		}
+		if (serialSend(port, "\x44\xbb", 2, 1) != 2) return errorRet(1, "failed to send\n");
+		if (serialRecv(port, &recvBuffer, 1, 1) != 1) return errorRet(1, "failed to receive\n");
+		if (recvBuffer != ACK) return errorRet(1, "what is returned is not ACK\n");
+		if (isGlobal) {
+			sendBuffer[0] = 0xff;
+			sendBuffer[1] = 0xff;
+			sendBuffer[2] = 0x00;
+			if (serialSend(port, sendBuffer, 3, 1) != 3) return errorRet(1, "failed to send\n");
+		} else {
+			unsigned char checksum;
+			sendBuffer[0] = (unsigned char)((erasePageCount - 1) >> 8);
+			sendBuffer[1] = (unsigned char)(erasePageCount - 1);
+			checksum = sendBuffer[0] ^ sendBuffer[1];
+			if (serialSend(port, sendBuffer, 2, 1) != 2) return errorRet(1, "failed to send\n");
+			for (i = 0; i < 0x10000; i++) {
+				if ((pagesToErase[i / 8] >> (i % 8)) & 1) {
+					sendBuffer[0] = (unsigned char)(i >> 8);
+					sendBuffer[1] = (unsigned char)i;
+					checksum ^= sendBuffer[0] ^ sendBuffer[1];
+					if (serialSend(port, sendBuffer, 2, 1) != 2) return errorRet(1, "failed to send\n");
+				}
+			}
+			sendBuffer[0] = checksum;
+			if (serialSend(port, sendBuffer, 1, 1) != 1) return errorRet(1, "failed to send\n");
+		}
+		if (serialRecv(port, &recvBuffer, 1, 1) != 1) return errorRet(1, "failed to receive\n");
+		if (recvBuffer != ACK) return errorRet(1, "what is returned is not ACK\n");
+	} else if (eraseSupported) {
+		if (highPageEraseRequested) {
+			return errorRet(1, "erase page >= 0x100 not supported\n");
+		}
+		if (erasePageCount > 0xff) {
+			return errorRet(1, "too many pages to erase\n");
+		}
+		if (serialSend(port, "\x43\xbc", 2, 1) != 2) return errorRet(1, "failed to send\n");
+		if (serialRecv(port, &recvBuffer, 1, 1) != 1) return errorRet(1, "failed to receive\n");
+		if (recvBuffer != ACK) return errorRet(1, "what is returned is not ACK\n");
+		if (isGlobal) {
+			sendBuffer[0] = 0xff;
+			sendBuffer[1] = 0x00;
+			if (serialSend(port, sendBuffer, 2, 1) != 2) return errorRet(1, "failed to send\n");
+		} else {
+			unsigned char checksum;
+			sendBuffer[0] = (unsigned char)(erasePageCount - 1);
+			checksum = sendBuffer[0];
+			if (serialSend(port, sendBuffer, 1, 1) != 1) return errorRet(1, "failed to send\n");
+			for (i = 0; i < 0x100; i++) {
+				if ((pagesToErase[i / 8] >> (i % 8)) & 1) {
+					sendBuffer[0] = (unsigned char)i;
+					if (serialSend(port, sendBuffer, 1, 1) != 1) return errorRet(1, "failed to send\n");
+					checksum ^= i;
+				}
+			}
+			sendBuffer[0] = checksum;
+			if (serialSend(port, sendBuffer, 1, 1) != 1) return errorRet(1, "failed to send\n");
+		}
+		if (serialRecv(port, &recvBuffer, 1, 1) != 1) return errorRet(1, "failed to receive\n");
+		if (recvBuffer != ACK) return errorRet(1, "what is returned is not ACK\n");
+	} else {
+		return errorRet(1, "erase is not supported\n");
+	}
 	return 0;
 }
 
